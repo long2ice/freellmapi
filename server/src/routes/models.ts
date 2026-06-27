@@ -5,6 +5,28 @@ import { hasProvider } from '../providers/index.js';
 
 export const modelsRouter = Router();
 
+modelsRouter.delete('/custom/:id', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: { message: 'Invalid id' } });
+    return;
+  }
+
+  const db = getDb();
+  const row = db.prepare("SELECT id FROM models WHERE id = ? AND platform = 'custom'").get(id);
+  if (!row) {
+    res.status(404).json({ error: { message: `Unknown custom model ${id}` } });
+    return;
+  }
+
+  const remove = db.transaction(() => {
+    db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
+    db.prepare("DELETE FROM models WHERE id = ? AND platform = 'custom'").run(id);
+  });
+  remove();
+  res.json({ success: true });
+});
+
 // List all models with availability info
 modelsRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
@@ -49,27 +71,4 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
   }));
 
   res.json(result);
-});
-
-// Remove a single custom chat model. Only the model row and its fallback-chain
-// entry are dropped; the endpoint key (api_keys) is left alone since other
-// models on the same endpoint may still use it — delete the key on the Keys
-// page to remove the whole endpoint. Built-in models can't be deleted.
-modelsRouter.delete('/custom/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id as string, 10);
-  if (isNaN(id)) {
-    res.status(400).json({ error: { message: 'Invalid id' } });
-    return;
-  }
-  const db = getDb();
-  const row = db.prepare("SELECT id FROM models WHERE id = ? AND platform = 'custom'").get(id) as { id: number } | undefined;
-  if (!row) {
-    res.status(404).json({ error: { message: 'Custom model not found' } });
-    return;
-  }
-  db.transaction(() => {
-    db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
-    db.prepare('DELETE FROM models WHERE id = ?').run(id);
-  })();
-  res.json({ success: true });
 });

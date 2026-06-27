@@ -9,6 +9,7 @@
 // cross-provider redundancy for free.
 import { getDb, getSetting } from '../db/index.js';
 import { decrypt } from '../lib/crypto.js';
+import { proxyFetch } from '../lib/proxy.js';
 
 export interface EmbeddingModelRow {
   id: number;
@@ -21,8 +22,6 @@ export interface EmbeddingModelRow {
   priority: number;
   enabled: number;
   quota_label: string;
-  // Set for custom OpenAI-compatible providers: binds this row to the api_keys
-  // row carrying its endpoint (base_url). NULL for built-in platforms.
   key_id: number | null;
 }
 
@@ -63,32 +62,40 @@ export function resolveFamily(model: string | undefined): string | null {
   return byModelId?.family ?? null;
 }
 
-interface ResolvedKey {
+interface ProviderCredential {
+  id: number;
   key: string;
-  baseUrl: string | null; // endpoint for custom providers; null for built-ins
+  baseUrl: string | null;
 }
 
-// Resolve the usable credential for a provider row. Custom rows bind to a
-// specific api_keys row (by key_id) so we read THAT endpoint's key + base_url;
-// built-in platforms take the first healthy key for their platform name.
-function getProviderKey(row: EmbeddingModelRow): ResolvedKey | null {
+function getProviderCredential(row: EmbeddingModelRow): ProviderCredential | null {
   if (row.key_id != null) {
-    const r = getDb().prepare(
-      "SELECT encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE id = ? AND enabled = 1 AND status IN ('healthy', 'unknown')",
-    ).get(row.key_id) as { encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
-    if (!r || !r.base_url) return null;
+    const keyRow = getDb().prepare(
+      "SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') LIMIT 1",
+    ).get(row.key_id) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
+    if (!keyRow) return null;
     try {
-      return { key: decrypt(r.encrypted_key, r.iv, r.auth_tag), baseUrl: r.base_url };
+      return {
+        id: keyRow.id,
+        key: decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag),
+        baseUrl: keyRow.base_url?.trim().replace(/\/+$/, '') ?? null,
+      };
     } catch {
       return null;
     }
   }
-  const r = getDb().prepare(
-    "SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id LIMIT 1",
-  ).get(row.platform) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
-  if (!r) return null;
+  if (row.platform === 'custom') return null;
+
+  const keyRow = getDb().prepare(
+    "SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id LIMIT 1",
+  ).get(row.platform) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
+  if (!keyRow) return null;
   try {
-    return { key: decrypt(r.encrypted_key, r.iv, r.auth_tag), baseUrl: null };
+    return {
+      id: keyRow.id,
+      key: decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag),
+      baseUrl: keyRow.base_url?.trim().replace(/\/+$/, '') ?? null,
+    };
   } catch {
     return null;
   }
@@ -112,11 +119,20 @@ async function openAiStyleEmbed(
   modelId: string,
   inputs: string[],
   extra: Record<string, unknown> = {},
+  dimensions?: number,
 ): Promise<ProviderCallResult> {
-  const r = await fetch(url, {
+  const body: Record<string, unknown> = { model: modelId, input: inputs, ...extra };
+  // Some providers (NVIDIA NeMo NIM, Google Gemini Embedding, OpenAI v3) support
+  // Matryoshka Representation Learning (MRL) — a smaller output_dim is valid and
+  // truncates the vector rather than failing. Others (HuggingFace feature-extraction,
+  // Cloudflare BGE) ignore unknown fields silently. We only forward the param when
+  // the caller asked for an explicit override, so providers that don't accept it
+  // see a request body identical to today.
+  if (dimensions !== undefined) body.dimensions = dimensions;
+  const r = await proxyFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ model: modelId, input: inputs, ...extra }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!r.ok) {
@@ -133,23 +149,32 @@ async function openAiStyleEmbed(
   };
 }
 
-async function callProvider(row: EmbeddingModelRow, key: string, baseUrl: string | null, inputs: string[]): Promise<ProviderCallResult> {
+export async function probeEmbeddingDimensions(baseUrl: string, key: string, modelId: string): Promise<number> {
+  const out = await openAiStyleEmbed(`${baseUrl.trim().replace(/\/+$/, '')}/embeddings`, key, modelId, ['dimension probe']);
+  const vector = out.vectors[0];
+  if (!Array.isArray(vector) || vector.length === 0) {
+    throw new EmbeddingsError('upstream returned malformed embeddings', 502);
+  }
+  return vector.length;
+}
+
+async function callProvider(row: EmbeddingModelRow, credential: ProviderCredential, inputs: string[], dimensions?: number): Promise<ProviderCallResult> {
+  const { key } = credential;
   switch (row.platform) {
     case 'custom':
-      // User-configured OpenAI-compatible endpoint (#117). base_url already has
-      // any trailing slash stripped when the endpoint was registered.
-      if (!baseUrl) throw new EmbeddingsError('custom embedding provider has no base_url', 500);
-      return openAiStyleEmbed(`${baseUrl}/embeddings`, key, row.model_id, inputs);
+      if (!credential.baseUrl) throw new EmbeddingsError('custom embedding provider is missing base_url', 500);
+      return openAiStyleEmbed(`${credential.baseUrl}/embeddings`, key, row.model_id, inputs, {}, dimensions);
     case 'google':
-      return openAiStyleEmbed('https://generativelanguage.googleapis.com/v1beta/openai/embeddings', key, row.model_id, inputs);
+      return openAiStyleEmbed('https://generativelanguage.googleapis.com/v1beta/openai/embeddings', key, row.model_id, inputs, {}, dimensions);
     case 'nvidia':
       // NeMo Retriever NIMs require input_type; 'query' is the symmetric-safe
       // choice for a gateway that can't know whether this is index or query time.
-      return openAiStyleEmbed('https://integrate.api.nvidia.com/v1/embeddings', key, row.model_id, inputs, { input_type: 'query' });
+      // MRL models (e.g. llama-nemotron-embed-1b-v2) accept dimensions and truncate.
+      return openAiStyleEmbed('https://integrate.api.nvidia.com/v1/embeddings', key, row.model_id, inputs, { input_type: 'query' }, dimensions);
     case 'openrouter':
-      return openAiStyleEmbed('https://openrouter.ai/api/v1/embeddings', key, row.model_id, inputs);
+      return openAiStyleEmbed('https://openrouter.ai/api/v1/embeddings', key, row.model_id, inputs, {}, dimensions);
     case 'github':
-      return openAiStyleEmbed('https://models.github.ai/inference/embeddings', key, row.model_id, inputs);
+      return openAiStyleEmbed('https://models.github.ai/inference/embeddings', key, row.model_id, inputs, {}, dimensions);
     case 'cloudflare': {
       // Key is stored as "account_id:token".
       const sep = key.indexOf(':');
@@ -158,12 +183,12 @@ async function callProvider(row: EmbeddingModelRow, key: string, baseUrl: string
       const token = key.slice(sep + 1);
       return openAiStyleEmbed(
         `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/embeddings`,
-        token, row.model_id, inputs,
+        token, row.model_id, inputs, {},
       );
     }
     case 'huggingface': {
       // HF serves embeddings as the feature-extraction task, not /v1/embeddings.
-      const r = await fetch(
+      const r = await proxyFetch(
         `https://router.huggingface.co/hf-inference/models/${row.model_id}/pipeline/feature-extraction`,
         {
           method: 'POST',
@@ -178,7 +203,7 @@ async function callProvider(row: EmbeddingModelRow, key: string, baseUrl: string
       return { vectors, inputTokens: null };
     }
     case 'cohere': {
-      const r = await fetch('https://api.cohere.com/v2/embed', {
+      const r = await proxyFetch('https://api.cohere.com/v2/embed', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
         body: JSON.stringify({
@@ -200,6 +225,7 @@ async function callProvider(row: EmbeddingModelRow, key: string, baseUrl: string
 
 function logEmbeddingRequest(
   row: EmbeddingModelRow,
+  keyId: number | null,
   status: 'success' | 'error',
   inputTokens: number,
   latencyMs: number,
@@ -208,28 +234,23 @@ function logEmbeddingRequest(
   try {
     getDb().prepare(`
       INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type)
-      VALUES (?, ?, NULL, ?, ?, 0, ?, ?, 'embedding')
-    `).run(row.platform, row.model_id, status, inputTokens, latencyMs, error);
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'embedding')
+    `).run(row.platform, row.model_id, keyId, status, inputTokens, latencyMs, error);
   } catch (e) {
     console.error('Failed to log embedding request:', e);
   }
 }
 
-/** Probe a custom OpenAI-compatible endpoint with a tiny request to discover
- * its embedding dimension. Used at registration time so the user doesn't have
- * to hand-enter the vector length. Throws EmbeddingsError on any failure. */
-export async function probeEmbeddingDimensions(baseUrl: string, key: string, modelId: string): Promise<number> {
-  const out = await openAiStyleEmbed(`${baseUrl}/embeddings`, key, modelId, ['probe']);
-  const dims = out.vectors[0]?.length;
-  if (!dims || dims < 1) {
-    throw new EmbeddingsError('endpoint returned no usable embedding vector', 502);
-  }
-  return dims;
-}
-
 /** Embed `inputs` via the family's provider chain, failing over within the
- * family on any provider error. Throws EmbeddingsError when the chain is dry. */
-export async function runEmbeddings(model: string | undefined, inputs: string[]): Promise<EmbeddingsResult> {
+ * family on any provider error. Throws EmbeddingsError when the chain is dry.
+ *
+ * `dimensions` (optional): client-supplied output-dimension override forwarded to
+ * providers that support MRL truncation (NVIDIA NeMo NIM, Google Gemini Embedding,
+ * OpenAI text-embedding-3-*). Providers that ignore the field see an identical
+ * request body. The override is independent of the model's native dimension — the
+ * family registry still pins the canonical dimension, this just lets callers ask
+ * for a smaller vector at the cost of some accuracy. */
+export async function runEmbeddings(model: string | undefined, inputs: string[], dimensions?: number): Promise<EmbeddingsResult> {
   const family = resolveFamily(model);
   if (!family) {
     throw new EmbeddingsError(
@@ -246,16 +267,16 @@ export async function runEmbeddings(model: string | undefined, inputs: string[])
 
   let lastError: EmbeddingsError | null = null;
   for (const row of chain) {
-    const resolved = getProviderKey(row);
-    if (!resolved) continue; // no usable key/endpoint for this provider — try the next one
+    const credential = getProviderCredential(row);
+    if (!credential) continue; // no usable key for this provider — try the next one
     const started = Date.now();
     try {
-      const out = await callProvider(row, resolved.key, resolved.baseUrl, inputs);
+      const out = await callProvider(row, credential, inputs, dimensions);
       if (out.vectors.length !== inputs.length || out.vectors.some(v => !Array.isArray(v) || v.length === 0)) {
         throw new EmbeddingsError('upstream returned malformed embeddings', 502);
       }
       const tokens = out.inputTokens ?? estimateTokens(inputs);
-      logEmbeddingRequest(row, 'success', tokens, Date.now() - started, null);
+      logEmbeddingRequest(row, credential.id, 'success', tokens, Date.now() - started, null);
       return {
         family,
         platform: row.platform,
@@ -266,7 +287,7 @@ export async function runEmbeddings(model: string | undefined, inputs: string[])
       };
     } catch (err: any) {
       const e = err instanceof EmbeddingsError ? err : new EmbeddingsError(String(err?.message ?? err), 502);
-      logEmbeddingRequest(row, 'error', 0, Date.now() - started, e.message.slice(0, 300));
+      logEmbeddingRequest(row, credential.id, 'error', 0, Date.now() - started, e.message.slice(0, 300));
       lastError = e;
       // fall through to the next provider in the family
     }
